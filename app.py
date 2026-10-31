@@ -3,6 +3,9 @@ from pypdf import PdfReader
 from docx import Document
 from io import BytesIO
 import re
+import json
+import uuid
+from pathlib import Path
 from datetime import datetime
 from xml.sax.saxutils import escape
 
@@ -14,6 +17,11 @@ from reportlab.lib.units import inch
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 )
+
+from auth_ui import render_auth_gate
+from database import init_db, get_connection
+from recruiter_dashboard import render_recruiter_dashboard 
+from admin_dashboard import render_admin_dashboard
 
 st.set_page_config(
     page_title="Resume Analyzer",
@@ -35,10 +43,13 @@ st.markdown("""
     color: #f3f4f6;
 }
 
+/* Extra top space prevents the signed-in row/auth controls from
+   sitting too close to Streamlit's top toolbar. */
+div[data-testid="stAppViewBlockContainer"],
 .block-container {
     max-width: 1150px;
-    padding-top: 2rem;
-    padding-bottom: 3rem;
+    padding-top: 4.5rem !important;
+    padding-bottom: 3rem !important;
 }
 
 h1, h2, h3 {
@@ -72,7 +83,7 @@ p, label, .stMarkdown {
     color: #f9fafb !important;
 }
 
-/* File uploader: readable instructions and button */
+/* File uploader */
 .stApp [data-testid="stFileUploader"] {
     color: #f9fafb !important;
 }
@@ -156,6 +167,7 @@ hr {
     border: 1px solid rgba(196,181,253,0.3);
     border-radius: 22px;
     padding: 28px;
+    margin-top: 0.75rem;
     margin-bottom: 24px;
     box-shadow: 0 15px 40px rgba(0,0,0,0.18);
 }
@@ -171,6 +183,146 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
+# -------------------- AUTHENTICATION --------------------
+# Students can access the existing analyzer.
+# Recruiter and admin dashboards will be connected in later modules.
+
+user = render_auth_gate()
+
+if user is None:
+    st.stop()
+
+if user["role"] == "recruiter":
+    render_recruiter_dashboard(user)
+    st.stop()
+
+elif user["role"] == "admin":
+    render_admin_dashboard(user)
+    st.stop()
+
+# -------------------- DATABASE & ANALYSIS HISTORY --------------------
+init_db()
+DATA_DIR = Path(__file__).resolve().parent / "resume_analyzer_data"
+RESUME_DIR = DATA_DIR / "resumes"
+REPORT_DIR = DATA_DIR / "reports"
+RESUME_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_analysis_record(owner_user_id, uploaded_resume, resume_text, job_title_value,
+                         job_description_value, required_values, essential_values,
+                         match_score, matched_values, missing_values,
+                         essential_matched_values, essential_missing_values,
+                         formatting_checks, recognized_headings, improvement_suggestions,
+                         report_bytes, share_with_recruiters=False):
+    """Persist one analysis and its report, owned by the currently logged-in student."""
+    analysis_token = uuid.uuid4().hex
+    suffix = Path(uploaded_resume.name).suffix.lower()
+    resume_kind = "pdf" if suffix == ".pdf" else "docx"
+    resume_path = RESUME_DIR / f"{analysis_token}{suffix}"
+    report_path = REPORT_DIR / f"{analysis_token}.pdf"
+
+    # Save files first; if the database insert fails, remove them again.
+    resume_path.write_bytes(uploaded_resume.getvalue())
+    report_path.write_bytes(report_bytes)
+
+    try:
+        with get_connection() as connection:
+            resume_cursor = connection.execute(
+                """INSERT INTO resumes
+                   (user_id, original_filename, stored_file_path, file_type)
+                   VALUES (?, ?, ?, ?)""",
+                (owner_user_id, Path(uploaded_resume.name).name,
+                 str(resume_path), resume_kind),
+            )
+            resume_id = resume_cursor.lastrowid
+
+            job_cursor = connection.execute(
+                """INSERT INTO job_descriptions
+                   (created_by, job_title, company_name, description_text,
+                    required_skills, essential_skills)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (owner_user_id, job_title_value.strip() or "Not specified", None,
+                 job_description_value.strip() or "Manual skill entry",
+                 json.dumps(required_values), json.dumps(essential_values)),
+            )
+            job_id = job_cursor.lastrowid
+
+            analysis_cursor = connection.execute(
+                """INSERT INTO analyses
+    (resume_id, job_id, match_score, matched_keywords,
+     missing_keywords, essential_skill_results,
+     formatting_results, suggestions, shared_with_recruiters)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (resume_id, job_id, float(match_score),
+                 json.dumps(matched_values), json.dumps(missing_values),
+                 json.dumps({"matched": essential_matched_values,
+                             "missing": essential_missing_values,
+                             "required": essential_values}),
+                 json.dumps({"checks": formatting_checks,
+                             "recognized_headings": recognized_headings}),
+                 json.dumps(improvement_suggestions),
+int(bool(share_with_recruiters))),
+            )
+            analysis_id = analysis_cursor.lastrowid
+
+            connection.execute(
+                "INSERT INTO reports (analysis_id, stored_file_path) VALUES (?, ?)",
+                (analysis_id, str(report_path)),
+            )
+        return analysis_id
+    except Exception:
+        for saved_path in (resume_path, report_path):
+            try:
+                saved_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+with st.expander("📚 My Analysis History", expanded=False):
+    with get_connection() as connection:
+        history_rows = connection.execute(
+            """SELECT a.analysis_id, a.match_score,
+       datetime(a.analyzed_at, '+5 hours', '+30 minutes') AS analyzed_at_ist,
+       j.job_title, r.stored_file_path
+               FROM analyses AS a
+               JOIN resumes AS rs ON rs.resume_id = a.resume_id
+               JOIN job_descriptions AS j ON j.job_id = a.job_id
+               LEFT JOIN reports AS r ON r.analysis_id = a.analysis_id
+               WHERE rs.user_id = ?
+               ORDER BY a.analyzed_at DESC, a.analysis_id DESC""",
+            (user["user_id"],),
+        ).fetchall()
+
+    if not history_rows:
+        st.info("No saved analyses yet. Your completed analyses will appear here.")
+    else:
+        st.caption("Only analyses belonging to your signed-in account are shown.")
+        for history_row in history_rows:
+            h1, h2, h3 = st.columns([2.2, 1, 1.4])
+            with h1:
+                st.write(f"**{history_row['job_title']}**")
+                st.caption(f"Analysis #{history_row['analysis_id']} · {history_row['analyzed_at_ist']} IST")
+            with h2:
+                st.metric("Match", f"{history_row['match_score']:.1f}%")
+            with h3:
+                saved_report = history_row["stored_file_path"]
+                if saved_report and Path(saved_report).is_file():
+                    st.download_button(
+                        "Download PDF",
+                        data=Path(saved_report).read_bytes(),
+                        file_name=f"resume_analysis_{history_row['analysis_id']}.pdf",
+                        mime="application/pdf",
+                        key=f"history_report_{history_row['analysis_id']}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("Report file unavailable")
+            st.divider()
+
+# -------------------- MAIN APPLICATION --------------------
+
 st.markdown("""
 <div class="hero">
     <h1>✨ Resume Analyzer</h1>
@@ -182,6 +334,71 @@ st.markdown("""
 st.caption("Academic Project Prototype | Resume Analysis Dashboard")
 st.divider()
 
+# -------------------- JOB DESCRIPTION SKILL EXTRACTION --------------------
+
+# Built-in skill vocabulary used for transparent, rule-based JD extraction.
+# Add more aliases here as the project vocabulary grows.
+SKILL_ALIASES = {
+    "Python": ["python"],
+    "Java": ["java"],
+    "C++": ["c++", "cpp"],
+    "C#": ["c#", "c sharp"],
+    "JavaScript": ["javascript", "js"],
+    "TypeScript": ["typescript"],
+    "HTML": ["html"],
+    "CSS": ["css"],
+    "React": ["react", "react.js", "reactjs"],
+    "Node.js": ["node.js", "nodejs", "node js"],
+    "SQL": ["sql"],
+    "MySQL": ["mysql"],
+    "PostgreSQL": ["postgresql", "postgres"],
+    "MongoDB": ["mongodb", "mongo db"],
+    "Excel": ["excel", "microsoft excel"],
+    "Power BI": ["power bi", "powerbi"],
+    "Tableau": ["tableau"],
+    "Machine Learning": ["machine learning", "ml"],
+    "Deep Learning": ["deep learning"],
+    "NLP": ["natural language processing", "nlp"],
+    "TensorFlow": ["tensorflow"],
+    "PyTorch": ["pytorch"],
+    "Data Analysis": ["data analysis", "data analytics"],
+    "Data Structures": ["data structures", "dsa"],
+    "Algorithms": ["algorithms", "algorithm design"],
+    "OOP": ["object oriented programming", "oops", "oop"],
+    "Git": ["git"],
+    "GitHub": ["github"],
+    "AWS": ["amazon web services", "aws"],
+    "Azure": ["microsoft azure", "azure"],
+    "Docker": ["docker"],
+    "Kubernetes": ["kubernetes", "k8s"],
+    "Linux": ["linux"],
+    "Cybersecurity": ["cybersecurity", "cyber security", "information security"],
+    "Communication": ["communication", "verbal communication", "written communication"],
+    "Leadership": ["leadership", "team leadership"],
+    "Problem Solving": ["problem solving", "problem-solving"],
+}
+
+
+def extract_skills_from_jd(description):
+    """Return canonical skill names found in a job description.
+
+    This is rule-based phrase matching, not semantic/AI extraction.
+    """
+    if not description or not description.strip():
+        return []
+
+    found = []
+    text = description.lower()
+    for skill_name, aliases in SKILL_ALIASES.items():
+        for alias in aliases:
+            # Alphanumeric lookarounds avoid partial matches such as SQL in NoSQL.
+            pattern = r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])"
+            if re.search(pattern, text):
+                found.append(skill_name)
+                break
+    return sorted(found, key=str.lower)
+
+
 # -------------------- INPUTS --------------------
 
 st.subheader("📂 Upload & Job Details")
@@ -189,7 +406,10 @@ st.subheader("📂 Upload & Job Details")
 col1, col2 = st.columns(2)
 
 with col1:
-    student_name = st.text_input("Candidate Name")
+    student_name = st.text_input(
+        "Candidate Name",
+        value=user["full_name"]
+    )
     job_title = st.text_input("Job Title")
 
 with col2:
@@ -198,10 +418,40 @@ with col2:
         type=["pdf", "docx"]
     )
 
-job_description = st.text_area(
-    "Required Job Skills (comma-separated)",
-    placeholder="Python, SQL, Java, Communication"
+st.markdown("### 🧾 Job Description")
+job_description_text = st.text_area(
+    "Paste the complete job description",
+    placeholder="Paste the responsibilities, qualifications and required skills from the job posting...",
+    height=180,
+    help="The system will scan this text for skills from its built-in skills dictionary."
 )
+
+extraction_mode = st.radio(
+    "How should required skills be selected?",
+    ["Automatic extraction from job description", "Enter skills manually"],
+    horizontal=True
+)
+
+manual_skills_input = ""
+if extraction_mode == "Enter skills manually":
+    manual_skills_input = st.text_input(
+        "Required Job Skills (comma-separated)",
+        placeholder="Python, SQL, Java, Communication"
+    )
+    required_skills = [
+        skill.strip() for skill in manual_skills_input.split(",") if skill.strip()
+    ]
+else:
+    required_skills = extract_skills_from_jd(job_description_text)
+    if job_description_text.strip():
+        if required_skills:
+            st.success("Skills detected from the job description:")
+            st.write(", ".join(required_skills))
+        else:
+            st.warning(
+                "No skills from the built-in dictionary were detected. "
+                "Try manual entry or review the job description wording."
+            )
 
 essential_skills_input = st.text_input(
     "Essential / Must-Have Skills (comma-separated)",
@@ -209,7 +459,8 @@ essential_skills_input = st.text_input(
 )
 
 st.caption(
-    "Essential skills should also be included in Required Job Skills."
+    "Essential skills should also be included in the detected or manually entered required skills. "
+    "Automatic extraction is dictionary-based and may not detect every skill."
 )
 
 # -------------------- HELPER FUNCTIONS --------------------
@@ -217,14 +468,14 @@ st.caption(
 def extract_resume_text(file):
     if file.name.lower().endswith(".pdf"):
         reader = PdfReader(BytesIO(file.getvalue()))
-        return "\n".join(
+        return "\\n".join(
             page.extract_text() or ""
             for page in reader.pages
         )
 
     if file.name.lower().endswith(".docx"):
         document = Document(BytesIO(file.getvalue()))
-        return "\n".join(
+        return "\\n".join(
             paragraph.text
             for paragraph in document.paragraphs
         )
@@ -416,14 +667,22 @@ def create_pdf_report(
 
 
 # -------------------- ANALYSIS --------------------
+share_with_recruiters = st.checkbox(
+    "Share this analysis and resume with recruiters",
+    value=False,
+    help="If enabled, recruiters can view your resume and analysis.",
+    key="share_with_recruiters"
+)
 
-if st.button("✨ Analyze Resume", type="primary", use_container_width=True):
+if st.button("✨ Analyze Resume", type="primary", use_container_width=True): 
 
     if uploaded_file is None:
         st.warning("Please upload a PDF or DOCX resume.")
 
-    elif not job_description.strip():
-        st.warning("Please enter the required job skills.")
+    elif not job_description_text.strip() and extraction_mode == "Automatic extraction from job description":
+        st.warning("Please paste a job description first.")
+    elif not required_skills:
+        st.warning("No required skills are available. Add a job description with recognized skills or use manual entry.")
 
     else:
         try:
@@ -439,7 +698,7 @@ if st.button("✨ Analyze Resume", type="primary", use_container_width=True):
 
                 required_keywords = {
                     skill.strip().lower()
-                    for skill in job_description.split(",")
+                    for skill in required_skills
                     if skill.strip()
                 }
 
@@ -634,6 +893,23 @@ if st.button("✨ Analyze Resume", type="primary", use_container_width=True):
                         found_headings,
                         suggestions
                     )
+                    
+                    try:
+                        saved_analysis_id = save_analysis_record(
+                            user["user_id"], uploaded_file, resume_text, job_title,
+                            job_description_text, sorted(required_keywords),
+                            sorted(essential_keywords), score, matched, missing,
+                            essential_matched, essential_missing,
+                            [(label, bool(result)) for label, result in checks],
+                            found_headings, suggestions, pdf_bytes,
+share_with_recruiters=share_with_recruiters
+)
+                        st.success(
+                            f"Analysis saved to your history (Analysis #{saved_analysis_id})."
+                        )
+                    except Exception as save_error:
+                        st.error("The report was generated, but saving it to history failed.")
+                        st.caption(f"Database detail: {save_error}")
 
                     st.download_button(
                         "⬇️ Download Analysis Report (PDF)",
